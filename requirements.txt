@@ -8,3 +8,4 @@ Pillow
 numpy
 scikit-learn
 tensorboard
+gunicorn
