@@ -1,12 +1,11 @@
 # 🧠 Deepfake Detection System
 
-A state-of-the-art deepfake detection system built with PyTorch and EfficientNet-B0, featuring a user-friendly web interface for real-time image and video analysis.
+A deepfake detection system built from scratch with PyTorch and EfficientNet-B0, featuring a user-friendly web interface for real-time image and video analysis.
 
-## ⚙️ Created By
+## ⚙️ Built By
 
-- 👨‍💻 [T RAHUL SINGH](https://github.com/TRahulsingh)
-- 🧑‍💻 [Mallikarjun Macherla](https://github.com/Mallikarjun-Macherla)
-- 🧑‍💻 [Sainath](https://github.com/sainathch45/)
+- 👨‍💻 [chinmayiii](https://github.com/chinmayiii)
+- Built and developed end-to-end from scratch
 
 ---
 
@@ -30,7 +29,7 @@ A state-of-the-art deepfake detection system built with PyTorch and EfficientNet
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/TRahulsingh/DeepfakeDetector.git
+  git clone https://github.com/chinmayiii/deepfake.git
    cd DeepfakeDetector
    ```
 
