@@ -5,7 +5,6 @@ A deepfake detection system built from scratch with PyTorch and EfficientNet-B0,
 ## ⚙️ Built By
 
 - 👨‍💻 [chinmayiii](https://github.com/chinmayiii)
-- Built and developed end-to-end from scratch
 
 ---
 
