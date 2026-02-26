@@ -9,3 +9,5 @@ numpy
 scikit-learn
 tensorboard
 gunicorn
+torchcam
+matplotlib
