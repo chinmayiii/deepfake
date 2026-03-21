@@ -1056,7 +1056,7 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
         gr.HTML(
             f"""
             <div class="lab-top-meta">
-                <div class="lab-meta-chip {'ok' if not model_load_error else 'warn'}">Model: {'Ready' if not model_load_error else 'Degraded'}</div>
+                <div class="lab-meta-chip {"ok" if not model_load_error else "warn"}">Model: {"Ready" if not model_load_error else "Degraded"}</div>
                 <div class="lab-meta-chip">Mode: {model_mode.title()}</div>
                 <div class="lab-meta-chip">Max Upload: {MAX_UPLOAD_MB} MB</div>
                 <div class="lab-meta-chip">Version: {APP_VERSION}</div>
