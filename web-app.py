@@ -1040,118 +1040,70 @@ label,
 """
 
 with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
-    with gr.Column(elem_classes=["lab-shell"]):
-        gr.Markdown(
-            """
-                        <div class="lab-hero">
-                            <div class="lab-hero-main">
-                                <div class="lab-title">Deepfake Detector Lab</div>
-                                <div class="lab-subtitle">Drop an image or video to see authenticity, heatmap evidence, and a plain-language summary.</div>
-                            </div>
-                        </div>
-                        """,
-            elem_id="lab-hero",
-        )
-
-        gr.HTML(
-            f"""
-            <div class="lab-top-meta">
-                <div class="lab-meta-chip {"ok" if not model_load_error else "warn"}">Model: {"Ready" if not model_load_error else "Degraded"}</div>
-                <div class="lab-meta-chip">Mode: {model_mode.title()}</div>
-                <div class="lab-meta-chip">Max Upload: {MAX_UPLOAD_MB} MB</div>
-                <div class="lab-meta-chip">Version: {APP_VERSION}</div>
+    gr.Markdown(
+        """
+            <div class="lab-hero">
+                <div class="lab-hero-main">
+                    <div class="lab-title">Deepfake Detector Lab</div>
+                    <div class="lab-subtitle">Drop an image or video to see authenticity, heatmap evidence, and a plain-language summary.</div>
+                </div>
             </div>
-            """
-        )
+        """,
+        elem_id="lab-hero",
+    )
+    gr.HTML(
+        f"""
+        <div class="lab-top-meta">
+            <div class="lab-meta-chip {"ok" if not model_load_error else "warn"}">Model: {"Ready" if not model_load_error else "Degraded"}</div>
+            <div class="lab-meta-chip">Mode: {model_mode.title()}</div>
+            <div class="lab-meta-chip">Max Upload: {MAX_UPLOAD_MB} MB</div>
+            <div class="lab-meta-chip">Version: {APP_VERSION}</div>
+        </div>
+        """
+    )
+    file_input = gr.File(label="Drag & drop image or video", file_types=[".jpg", ".jpeg", ".png", ".mp4", ".mov"])
+    upload_feedback = gr.HTML(build_upload_feedback(None))
+    upload_thumb = gr.Image(label="Upload Preview", interactive=False, elem_classes=["upload-thumb", "result-fade"])
+    analyze_btn = gr.Button("Analyze Evidence", variant="primary")
+    map_score = gr.HTML(value="")
+    preview = gr.Image(label="Preview (Red Grad-CAM)", interactive=False, elem_classes=["lab-preview-image", "result-fade"])
+    status_panel = gr.HTML(value="")
+    prediction = gr.Textbox(label="Prediction", interactive=False)
+    confidence = gr.Textbox(label="Confidence (%)", interactive=False)
+    generation = gr.Textbox(label="Generation Type", interactive=False)
+    diffusion_score = gr.Textbox(label="Diffusion Score", interactive=False)
+    explanation = gr.Textbox(label="Explanation", lines=4, interactive=False)
+    graph = gr.Image(label="Frame-Level Fake Confidence", interactive=False)
 
-        with gr.Row(equal_height=True, elem_classes=["lab-main-grid"]):
-            with gr.Column(scale=5, min_width=320, elem_classes=["lab-col-evidence"]):
-                with gr.Column(elem_classes=["lab-panel"]):
-                    gr.Markdown(
-                        '<span class="lab-badge">Upload</span><span class="lab-panel-title">Evidence Input</span>'
-                    )
-                    file_input = gr.File(
-                        label="Drag & drop image or video",
-                        file_types=[".jpg", ".jpeg", ".png", ".mp4", ".mov"],
-                    )
-                    gr.Markdown(
-                        '<div class="lab-helper">Accepted: JPG, PNG, MP4, MOV. Best results with faces >= 256px.</div>'
-                    )
-                    upload_feedback = gr.HTML(build_upload_feedback(None))
-                    upload_thumb = gr.Image(
-                        label="Upload Preview",
-                        interactive=False,
-                        elem_classes=["upload-thumb", "result-fade"],
-                    )
-                    with gr.Row(elem_classes=["lab-actions"]):
-                        analyze_btn = gr.Button("Analyze Evidence", variant="primary")
-                        clear_btn = gr.ClearButton(
-                            [
-                                file_input,
-                                prediction,
-                                confidence,
-                                status_panel,
-                                map_score,
-                                upload_feedback,
-                                upload_thumb,
-                                preview,
-                                graph,
-                                generation,
-                                diffusion_score,
-                                explanation,
-                            ],
-                            label="Clear",
-                            variant="secondary",
-                            elem_classes=["secondary"],
-                        )
+# Place ClearButton after all components are defined, outside all UI blocks
+clear_btn = gr.ClearButton(
+    [
+        file_input,
+        prediction,
+        confidence,
+        status_panel,
+        map_score,
+        upload_feedback,
+        upload_thumb,
+        preview,
+        graph,
+        generation,
+        diffusion_score,
+        explanation,
+    ],
+    elem_classes=["secondary"],
+)
 
-            with gr.Column(scale=7, min_width=360, elem_classes=["lab-col-map"]):
-                with gr.Column(elem_classes=["lab-panel", "lab-preview-panel"]):
-                    gr.Markdown(
-                        '<span class="lab-badge">Visuals</span><span class="lab-panel-title">Evidence Map</span>'
-                    )
-                    map_score = gr.HTML(value="")
-                    preview = gr.Image(
-                        label="Preview (Red Grad-CAM)",
-                        interactive=False,
-                        elem_classes=["lab-preview-image", "result-fade"],
-                    )
+# Launch Gradio app on a new port if run as main
+if __name__ == "__main__":
+    demo.launch(server_port=7861)
 
-        with gr.Row(equal_height=True, elem_classes=["lab-bottom-grid"]):
-            with gr.Column(scale=7, min_width=340, elem_classes=["lab-col-summary"]):
-                with gr.Column(
-                    elem_classes=["lab-panel", "lab-metrics", "result-fade"]
-                ):
-                    gr.Markdown(
-                        '<span class="lab-badge">Summary</span><span class="lab-panel-title">Decision</span>'
-                    )
-                    status_panel = gr.HTML(value="")
-                    with gr.Row():
-                        prediction = gr.Textbox(label="Prediction", interactive=False)
-                        confidence = gr.Textbox(
-                            label="Confidence (%)", interactive=False
-                        )
-
-                    with gr.Row():
-                        generation = gr.Textbox(
-                            label="Generation Type", interactive=False
-                        )
-                        diffusion_score = gr.Textbox(
-                            label="Diffusion Score", interactive=False
-                        )
-
-                    explanation = gr.Textbox(
-                        label="Explanation", lines=4, interactive=False
-                    )
-
-            with gr.Column(scale=5, min_width=340, elem_classes=["lab-col-temporal"]):
-                with gr.Column(elem_classes=["lab-panel", "result-fade"]):
-                    gr.Markdown(
-                        '<span class="lab-badge">Temporal</span><span class="lab-panel-title">Frame Graph</span>'
-                    )
-                    graph = gr.Image(
-                        label="Frame-Level Fake Confidence", interactive=False
-                    )
+        with gr.Column(scale=5, min_width=340, elem_classes=["lab-col-temporal"]):
+            with gr.Column(elem_classes=["lab-panel", "result-fade"]):
+                gr.Markdown(
+                    '<span class="lab-badge">Temporal</span><span class="lab-panel-title">Frame Graph</span>'
+                )
+                graph = gr.Image(label="Frame-Level Fake Confidence", interactive=False)
 
         def handle_input(file_obj):
             return predict_file(file_obj)
