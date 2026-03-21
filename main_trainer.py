@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.models import EfficientNet_B0_Weights
 
-from datasets.hybrid_loader import HybridDeepfakeDataset
+from DeepfakeDetector.hybrid_loader import HybridDeepfakeDataset
 from lightning_modules.detector import DeepfakeDetector, HybridEfficientNet
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
