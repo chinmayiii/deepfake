@@ -11,3 +11,5 @@ tensorboard
 gunicorn
 torchcam
 matplotlib
+fastapi
+uvicorn

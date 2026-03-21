@@ -2,6 +2,9 @@ import os
 import io
 import base64
 import tempfile
+import time
+import uuid
+import hashlib
 from pathlib import Path
 import gradio as gr
 import torch
@@ -12,7 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, UploadFile, File
 from torchcam.methods import GradCAM
-from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0
+from torchvision.models import efficientnet_b0
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 
@@ -20,31 +23,130 @@ from lightning_modules.detector import HybridEfficientNet
 from utils.diffusion_heuristics import diffusion_heuristic_score, classify_generation
 from utils.fft_utils import fft_from_pil
 
-HYBRID_MODEL_PATH = Path("models/best_model-hybrid.pt")
-LEGACY_MODEL_PATH = Path("models/best_model-v3.pt")
+ROOT_DIR = Path(__file__).resolve().parent
+HYBRID_MODEL_PATH = ROOT_DIR / "models" / "best_model-hybrid.pt"
+LEGACY_MODEL_PATH = ROOT_DIR / "models" / "best_model-v3.pt"
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
+
+
+def _extract_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                checkpoint = checkpoint[key]
+                break
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Checkpoint does not contain a valid state dict")
+
+    cleaned = {}
+    for key, value in checkpoint.items():
+        new_key = key
+        for prefix in ("model.", "module.", "net."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        cleaned[new_key] = value
+    return cleaned
+
+
+def _load_checkpoint(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = _extract_state_dict(checkpoint)
+    model.load_state_dict(state_dict, strict=False)
 
 
 # === Load Model ===
 def load_model():
-    weights = EfficientNet_B0_Weights.IMAGENET1K_V1
-    if HYBRID_MODEL_PATH.exists():
-        model = HybridEfficientNet(weights=weights)
-        model.load_state_dict(torch.load(HYBRID_MODEL_PATH, map_location="cpu"))
-        model_mode = "hybrid"
-    else:
-        model = efficientnet_b0(weights=weights)
+    # Keep startup offline-safe: no external downloads needed when loading local checkpoints.
+    if os.environ.get("SKIP_MODEL_LOAD", "0") == "1":
+        model = efficientnet_b0(weights=None)
         model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
-        model.load_state_dict(torch.load(LEGACY_MODEL_PATH, map_location="cpu"))
-        model_mode = "single"
+        model.eval()
+        return model, "single", "Model loading skipped (SKIP_MODEL_LOAD=1)"
+
+    weights = None
+    errors = []
+
+    if HYBRID_MODEL_PATH.exists():
+        try:
+            model = HybridEfficientNet(weights=weights)
+            _load_checkpoint(model, HYBRID_MODEL_PATH)
+            model.eval()
+            return model, "hybrid", ""
+        except Exception as exc:
+            errors.append(f"hybrid checkpoint load failed: {exc}")
+
+    if LEGACY_MODEL_PATH.exists():
+        model = efficientnet_b0(weights=weights)
+        try:
+            model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
+            _load_checkpoint(model, LEGACY_MODEL_PATH)
+            model.eval()
+            return model, "single", ""
+        except Exception as exc:
+            errors.append(f"legacy checkpoint load failed: {exc}")
+
+    model = efficientnet_b0(weights=None)
+    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
     model.eval()
-    return model, model_mode
+    if errors:
+        return model, "single", "; ".join(errors)
+    return (
+        model,
+        "single",
+        f"No model checkpoint found at {HYBRID_MODEL_PATH} or {LEGACY_MODEL_PATH}",
+    )
 
 
-model, model_mode = load_model()
+model, model_mode, model_load_error = load_model()
 if model_mode == "hybrid":
     cam_extractor = GradCAM(model, target_layer=model.rgb_backbone.features[-1])
 else:
     cam_extractor = GradCAM(model, target_layer=model.features[-1])
+
+
+def get_model_error_message():
+    if not model_load_error:
+        return ""
+    return f"Model is not ready: {model_load_error}"
+
+
+def hash_bytes(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+def validate_upload(content, filename):
+    if not content:
+        raise ValueError("Uploaded file is empty")
+    size_mb = len(content) / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        raise ValueError(
+            f"File too large ({size_mb:.2f} MB). Limit is {MAX_UPLOAD_MB} MB"
+        )
+    if filename and Path(filename).suffix.lower() not in {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".mp4",
+        ".mov",
+    }:
+        raise ValueError("Unsupported extension. Use .jpg, .jpeg, .png, .mp4, .mov")
+
+
+def build_meta(start_time, filename, content):
+    return {
+        "request_id": str(uuid.uuid4()),
+        "processing_ms": round((time.perf_counter() - start_time) * 1000, 2),
+        "app_version": APP_VERSION,
+        "model_mode": model_mode,
+        "model_checkpoint": str(
+            HYBRID_MODEL_PATH if model_mode == "hybrid" else LEGACY_MODEL_PATH
+        ),
+        "filename": filename,
+        "sha256": hash_bytes(content),
+    }
+
 
 # === Preprocessing ===
 preprocess = transforms.Compose(
@@ -67,6 +169,8 @@ def forward_model(input_img):
 
 
 def predict_with_cam(img):
+    if model_load_error:
+        raise RuntimeError(get_model_error_message())
     input_img = img.resize((224, 224))
     model.zero_grad(set_to_none=True)
     out = forward_model(input_img)
@@ -96,6 +200,8 @@ def predict_with_cam(img):
 
 
 def predict_fake_prob(img):
+    if model_load_error:
+        raise RuntimeError(get_model_error_message())
     input_img = img.resize((224, 224))
     out = forward_model(input_img)
     probs = torch.softmax(out, dim=1)[0]
@@ -226,6 +332,21 @@ def build_upload_feedback(file_obj):
 
 
 def predict_file(file_obj):
+    if model_load_error:
+        return (
+            "❌ Model load failed",
+            "",
+            "",
+            "",
+            build_upload_feedback(file_obj),
+            None,
+            None,
+            None,
+            "",
+            "",
+            get_model_error_message(),
+        )
+
     if file_obj is None:
         return (
             "⚠️ No file selected",
@@ -908,7 +1029,7 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
                     gr.Markdown(
                         '<span class="lab-badge">Visuals</span><span class="lab-panel-title">Evidence Map</span>'
                     )
-                    map_score = gr.HTML(value='')
+                    map_score = gr.HTML(value="")
                     preview = gr.Image(
                         label="Preview (Red Grad-CAM)",
                         interactive=False,
@@ -917,7 +1038,9 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
 
         with gr.Row(equal_height=True, elem_classes=["lab-bottom-grid"]):
             with gr.Column(scale=7, min_width=340, elem_classes=["lab-col-summary"]):
-                with gr.Column(elem_classes=["lab-panel", "lab-metrics", "result-fade"]):
+                with gr.Column(
+                    elem_classes=["lab-panel", "lab-metrics", "result-fade"]
+                ):
                     gr.Markdown(
                         '<span class="lab-badge">Summary</span><span class="lab-panel-title">Decision</span>'
                     )
@@ -990,9 +1113,41 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
 app = FastAPI()
 
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok" if not model_load_error else "degraded",
+        "model_ready": not bool(model_load_error),
+        "model_mode": model_mode,
+        "app_version": APP_VERSION,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "error": model_load_error or "",
+    }
+
+
+@app.get("/model-info")
+async def model_info():
+    return {
+        "model_mode": model_mode,
+        "hybrid_checkpoint": str(HYBRID_MODEL_PATH),
+        "legacy_checkpoint": str(LEGACY_MODEL_PATH),
+        "loaded_checkpoint": str(
+            HYBRID_MODEL_PATH if model_mode == "hybrid" else LEGACY_MODEL_PATH
+        ),
+        "model_ready": not bool(model_load_error),
+        "load_error": model_load_error or "",
+        "app_version": APP_VERSION,
+    }
+
+
 @app.post("/detect")
 async def detect(file: UploadFile = File(...)):
+    start_time = time.perf_counter()
+    if model_load_error:
+        return {"error": get_model_error_message()}
+
     content = await file.read()
+    validate_upload(content, file.filename)
     suffix = Path(file.filename or "").suffix.lower()
     if not suffix:
         suffix = ".bin"
@@ -1016,6 +1171,7 @@ async def detect(file: UploadFile = File(...)):
                 "diffusion_score": round(diffusion_score, 4),
                 "reasons": reasons,
                 "heatmap": image_to_base64(overlay),
+                "meta": build_meta(start_time, file.filename, content),
             }
 
         if mime and mime.startswith("video"):
@@ -1042,6 +1198,7 @@ async def detect(file: UploadFile = File(...)):
                 "frame_probs": [round(p, 4) for p in frame_probs],
                 "heatmap": image_to_base64(overlay),
                 "frame_graph": image_to_base64(graph),
+                "meta": build_meta(start_time, file.filename, content),
             }
 
         return {"error": "Unsupported file type"}
@@ -1050,6 +1207,126 @@ async def detect(file: UploadFile = File(...)):
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+@app.post("/detect/batch")
+async def detect_batch(files: list[UploadFile] = File(...)):
+    if model_load_error:
+        return {"error": get_model_error_message()}
+
+    if len(files) > 10:
+        return {"error": "Batch limit exceeded. Maximum 10 files per request."}
+
+    results = []
+    for file in files:
+        start_time = time.perf_counter()
+        content = await file.read()
+        try:
+            validate_upload(content, file.filename)
+        except ValueError as exc:
+            results.append(
+                {
+                    "filename": file.filename,
+                    "error": str(exc),
+                    "meta": build_meta(start_time, file.filename, content),
+                }
+            )
+            continue
+
+        suffix = Path(file.filename or "").suffix.lower() or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        try:
+            mime, _ = mimetypes.guess_type(tmp_path)
+            if mime and mime.startswith("image"):
+                img = Image.open(tmp_path).convert("RGB")
+                label, _, _, fake_prob = predict_with_cam(img)
+                diffusion_score = diffusion_heuristic_score(img)
+                generation = classify_generation(fake_prob, diffusion_score)
+                reasons = build_reasons(fake_prob, diffusion_score)
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "type": "image",
+                        "prediction": label,
+                        "confidence": round(fake_prob, 4),
+                        "generation": generation,
+                        "diffusion_score": round(diffusion_score, 4),
+                        "reasons": reasons,
+                        "meta": build_meta(start_time, file.filename, content),
+                    }
+                )
+            elif mime and mime.startswith("video"):
+                frames = sample_video_frames(tmp_path)
+                if not frames:
+                    results.append(
+                        {
+                            "filename": file.filename,
+                            "error": "Could not read video",
+                            "meta": build_meta(start_time, file.filename, content),
+                        }
+                    )
+                    continue
+
+                frame_probs = [predict_fake_prob(frame) for frame in frames]
+                diffusion_scores = [
+                    diffusion_heuristic_score(frame) for frame in frames
+                ]
+                avg_prob = float(np.mean(frame_probs))
+                avg_diffusion = float(np.mean(diffusion_scores))
+                generation = classify_generation(avg_prob, avg_diffusion)
+                reasons = build_reasons(
+                    avg_prob, avg_diffusion, frame_probs=frame_probs
+                )
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "type": "video",
+                        "prediction": "🔴 Deepfake (avg)"
+                        if avg_prob >= 0.5
+                        else "🟢 Real (avg)",
+                        "confidence": round(avg_prob, 4),
+                        "generation": generation,
+                        "diffusion_score": round(avg_diffusion, 4),
+                        "reasons": reasons,
+                        "meta": build_meta(start_time, file.filename, content),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "error": "Unsupported file type",
+                        "meta": build_meta(start_time, file.filename, content),
+                    }
+                )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    manipulated = sum(
+        1
+        for item in results
+        if "prediction" in item and "Deepfake" in item["prediction"]
+    )
+    authentic = sum(
+        1 for item in results if "prediction" in item and "Real" in item["prediction"]
+    )
+    failed = sum(1 for item in results if "error" in item)
+
+    return {
+        "count": len(results),
+        "summary": {
+            "manipulated": manipulated,
+            "authentic": authentic,
+            "failed": failed,
+        },
+        "results": results,
+    }
 
 
 app = gr.mount_gradio_app(app, demo, path="/")

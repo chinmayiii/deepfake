@@ -5,6 +5,12 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python web-app.py
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.8
+      - key: APP_VERSION
+        value: 1.0.0
+      - key: MAX_UPLOAD_MB
+        value: 50
