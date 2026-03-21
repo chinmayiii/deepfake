@@ -542,6 +542,39 @@ html, body, .gradio-container {
     max-width: 760px;
 }
 
+.lab-top-meta {
+    margin-top: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.lab-meta-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 999px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: #2e384d;
+    background: rgba(255, 255, 255, 0.74);
+    border: 1px solid rgba(75, 98, 131, 0.18);
+}
+
+.lab-meta-chip.ok {
+    color: #1c6f4d;
+    border-color: rgba(36, 160, 107, 0.35);
+    background: rgba(206, 244, 225, 0.58);
+}
+
+.lab-meta-chip.warn {
+    color: #8c3d4a;
+    border-color: rgba(216, 75, 95, 0.35);
+    background: rgba(252, 219, 225, 0.62);
+}
+
 .lab-main-grid {
     display: grid !important;
     grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -694,6 +727,24 @@ html, body, .gradio-container {
     font-weight: 700 !important;
     box-shadow: 0 10px 22px rgba(76, 181, 174, 0.28) !important;
     transition: transform 220ms ease, box-shadow 220ms ease, filter 220ms ease !important;
+}
+
+.lab-actions {
+    margin-top: 6px;
+    gap: 10px !important;
+}
+
+.lab-actions .secondary {
+    border: 1px solid rgba(72, 90, 126, 0.22) !important;
+    background: rgba(255, 255, 255, 0.72) !important;
+    color: #2a3347 !important;
+    box-shadow: none !important;
+}
+
+.lab-actions .secondary:hover {
+    border-color: rgba(72, 90, 126, 0.38) !important;
+    box-shadow: 0 10px 22px rgba(31, 45, 68, 0.12) !important;
+    transform: translateY(-1px);
 }
 
 .lab-actions button:hover,
@@ -1002,6 +1053,17 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
             elem_id="lab-hero",
         )
 
+        gr.HTML(
+            f"""
+            <div class="lab-top-meta">
+                <div class="lab-meta-chip {'ok' if not model_load_error else 'warn'}">Model: {'Ready' if not model_load_error else 'Degraded'}</div>
+                <div class="lab-meta-chip">Mode: {model_mode.title()}</div>
+                <div class="lab-meta-chip">Max Upload: {MAX_UPLOAD_MB} MB</div>
+                <div class="lab-meta-chip">Version: {APP_VERSION}</div>
+            </div>
+            """
+        )
+
         with gr.Row(equal_height=True, elem_classes=["lab-main-grid"]):
             with gr.Column(scale=5, min_width=320, elem_classes=["lab-col-evidence"]):
                 with gr.Column(elem_classes=["lab-panel"]):
@@ -1022,7 +1084,8 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
                         elem_classes=["upload-thumb", "result-fade"],
                     )
                     with gr.Row(elem_classes=["lab-actions"]):
-                        clear_btn = gr.ClearButton()
+                        analyze_btn = gr.Button("Analyze Evidence", variant="primary")
+                        clear_btn = gr.ClearButton("Clear", variant="secondary")
 
             with gr.Column(scale=7, min_width=360, elem_classes=["lab-col-map"]):
                 with gr.Column(elem_classes=["lab-panel", "lab-preview-panel"]):
@@ -1075,7 +1138,26 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
         def handle_input(file_obj):
             return predict_file(file_obj)
 
+        def preview_file(file_obj):
+            if file_obj is None:
+                return build_upload_feedback(None), None
+            path = file_obj.name
+            mime, _ = mimetypes.guess_type(path)
+            if mime and mime.startswith("image"):
+                try:
+                    img = Image.open(path).convert("RGB")
+                    return build_upload_feedback(file_obj), img.resize((300, 300))
+                except Exception:
+                    return build_upload_feedback(file_obj), None
+            return build_upload_feedback(file_obj), None
+
         file_input.change(
+            fn=preview_file,
+            inputs=file_input,
+            outputs=[upload_feedback, upload_thumb],
+        )
+
+        analyze_btn.click(
             fn=handle_input,
             inputs=file_input,
             outputs=[
