@@ -1085,7 +1085,25 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
                     )
                     with gr.Row(elem_classes=["lab-actions"]):
                         analyze_btn = gr.Button("Analyze Evidence", variant="primary")
-                        clear_btn = gr.ClearButton("Clear", variant="secondary")
+                        clear_btn = gr.ClearButton(
+                            [
+                                file_input,
+                                prediction,
+                                confidence,
+                                status_panel,
+                                map_score,
+                                upload_feedback,
+                                upload_thumb,
+                                preview,
+                                graph,
+                                generation,
+                                diffusion_score,
+                                explanation,
+                            ],
+                            label="Clear",
+                            variant="secondary",
+                            elem_classes=["secondary"],
+                        )
 
             with gr.Column(scale=7, min_width=360, elem_classes=["lab-col-map"]):
                 with gr.Column(elem_classes=["lab-panel", "lab-preview-panel"]):
@@ -1138,6 +1156,22 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
         def handle_input(file_obj):
             return predict_file(file_obj)
 
+        def clear_outputs():
+            return (
+                None,
+                "",
+                "",
+                "",
+                "",
+                build_upload_feedback(None),
+                None,
+                None,
+                None,
+                "",
+                "",
+                "",
+            )
+
         def preview_file(file_obj):
             if file_obj is None:
                 return build_upload_feedback(None), None
@@ -1175,8 +1209,10 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
             ],
         )
 
-        clear_btn.add(
-            [
+        clear_btn.click(
+            fn=clear_outputs,
+            inputs=[],
+            outputs=[
                 file_input,
                 prediction,
                 confidence,
@@ -1189,7 +1225,7 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
                 generation,
                 diffusion_score,
                 explanation,
-            ]
+            ],
         )
 
 app = FastAPI()
