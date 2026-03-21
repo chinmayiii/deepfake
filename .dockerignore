@@ -7,5 +7,11 @@ __pycache__
 *.pyd
 *.log
 *.pid
-*.txt
+debug_status*.txt
+import_check.txt
+launch_status.txt
+port_check.txt
+python_probe.txt
+snippet_heartbeat.txt
+startup_capture.txt
 .vscode
