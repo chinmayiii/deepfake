@@ -73,6 +73,7 @@ Thumbs.db
 # Local runtime/debug artifacts
 *.stackdump
 *.pid
+app_runtime.log
 debug_status*.txt
 launch_status.txt
 port_check.txt
