@@ -1,10 +1,12 @@
 import os
 import io
+import json
 import base64
 import tempfile
 import time
 import uuid
 import hashlib
+import threading
 from pathlib import Path
 import gradio as gr
 import torch
@@ -13,7 +15,8 @@ from PIL import Image
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Header, Request
+from fastapi.responses import JSONResponse
 from torchcam.methods import GradCAM
 from torchvision.models import efficientnet_b0
 from torchvision import transforms
@@ -28,6 +31,264 @@ HYBRID_MODEL_PATH = ROOT_DIR / "models" / "best_model-hybrid.pt"
 LEGACY_MODEL_PATH = ROOT_DIR / "models" / "best_model-v3.pt"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
+METRICS_ADMIN_TOKEN = os.environ.get("METRICS_ADMIN_TOKEN", "")
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+MAX_REQUEST_SECONDS = int(os.environ.get("MAX_REQUEST_SECONDS", "30"))
+EVAL_SUMMARY_PATH = Path(
+    os.environ.get("EVAL_SUMMARY_PATH", str(ROOT_DIR / "docs" / "eval_summary.json"))
+)
+APP_START_TIME = time.time()
+
+SUPPORTED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".mp4", ".mov"]
+MAX_BATCH_FILES = 10
+
+_METRICS_LOCK = threading.Lock()
+_API_METRICS = {
+    "totals": {
+        "requests": 0,
+        "successful": 0,
+        "failed": 0,
+        "items_processed": 0,
+        "manipulated": 0,
+        "authentic": 0,
+        "uncertain": 0,
+        "latency_ms_sum": 0.0,
+    },
+    "endpoints": {},
+}
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_STATE = {}
+_RATE_LIMIT_PRUNE_EVERY = 200
+_RATE_LIMIT_HITS = 0
+
+
+def _reset_api_metrics():
+    with _METRICS_LOCK:
+        totals = _API_METRICS["totals"]
+        totals["requests"] = 0
+        totals["successful"] = 0
+        totals["failed"] = 0
+        totals["items_processed"] = 0
+        totals["manipulated"] = 0
+        totals["authentic"] = 0
+        totals["uncertain"] = 0
+        totals["latency_ms_sum"] = 0.0
+        _API_METRICS["endpoints"] = {}
+
+
+def _enforce_rate_limit(endpoint, client_key):
+    global _RATE_LIMIT_HITS
+    now = time.time()
+    window_start = now - 60
+    key = (endpoint, str(client_key or "unknown"))
+
+    with _RATE_LIMIT_LOCK:
+        _RATE_LIMIT_HITS += 1
+        recent_calls = _RATE_LIMIT_STATE.get(key, [])
+        recent_calls = [ts for ts in recent_calls if ts >= window_start]
+
+        if RATE_LIMIT_PER_MIN > 0 and len(recent_calls) >= RATE_LIMIT_PER_MIN:
+            _RATE_LIMIT_STATE[key] = recent_calls
+            raise PermissionError("Rate limit exceeded. Please retry later.")
+
+        recent_calls.append(now)
+        _RATE_LIMIT_STATE[key] = recent_calls
+
+        if _RATE_LIMIT_HITS % _RATE_LIMIT_PRUNE_EVERY == 0:
+            for state_key, timestamps in list(_RATE_LIMIT_STATE.items()):
+                fresh = [ts for ts in timestamps if ts >= window_start]
+                if fresh:
+                    _RATE_LIMIT_STATE[state_key] = fresh
+                else:
+                    _RATE_LIMIT_STATE.pop(state_key, None)
+
+
+def _ensure_not_timed_out(start_time):
+    if (
+        MAX_REQUEST_SECONDS > 0
+        and (time.perf_counter() - start_time) > MAX_REQUEST_SECONDS
+    ):
+        raise TimeoutError(f"Request exceeded timeout of {MAX_REQUEST_SECONDS} seconds")
+
+
+def _safe_ratio(numerator, denominator):
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 4)
+
+
+def _update_api_metrics(
+    endpoint,
+    duration_ms,
+    success,
+    items_processed=1,
+    manipulated=0,
+    authentic=0,
+    uncertain=0,
+):
+    with _METRICS_LOCK:
+        totals = _API_METRICS["totals"]
+        totals["requests"] += 1
+        totals["successful"] += 1 if success else 0
+        totals["failed"] += 0 if success else 1
+        totals["items_processed"] += max(int(items_processed), 0)
+        totals["manipulated"] += max(int(manipulated), 0)
+        totals["authentic"] += max(int(authentic), 0)
+        totals["uncertain"] += max(int(uncertain), 0)
+        totals["latency_ms_sum"] += max(float(duration_ms), 0.0)
+
+        endpoint_metrics = _API_METRICS["endpoints"].setdefault(
+            endpoint,
+            {
+                "requests": 0,
+                "successful": 0,
+                "failed": 0,
+                "items_processed": 0,
+                "manipulated": 0,
+                "authentic": 0,
+                "uncertain": 0,
+                "latency_ms_sum": 0.0,
+            },
+        )
+        endpoint_metrics["requests"] += 1
+        endpoint_metrics["successful"] += 1 if success else 0
+        endpoint_metrics["failed"] += 0 if success else 1
+        endpoint_metrics["items_processed"] += max(int(items_processed), 0)
+        endpoint_metrics["manipulated"] += max(int(manipulated), 0)
+        endpoint_metrics["authentic"] += max(int(authentic), 0)
+        endpoint_metrics["uncertain"] += max(int(uncertain), 0)
+        endpoint_metrics["latency_ms_sum"] += max(float(duration_ms), 0.0)
+
+
+def _verdict_counts_from_prediction(prediction_text):
+    text = str(prediction_text or "").lower()
+    if "deepfake" in text or "manipulated" in text:
+        return 1, 0, 0
+    if "real" in text or "authentic" in text:
+        return 0, 1, 0
+    return 0, 0, 1
+
+
+def _build_metrics_response():
+    uptime_sec = round(time.time() - APP_START_TIME, 2)
+    with _METRICS_LOCK:
+        totals = dict(_API_METRICS["totals"])
+        endpoints_raw = {
+            key: dict(value) for key, value in _API_METRICS["endpoints"].items()
+        }
+
+    total_requests = totals["requests"]
+    totals["avg_latency_ms"] = (
+        round(totals["latency_ms_sum"] / total_requests, 2) if total_requests else 0.0
+    )
+    totals["success_rate"] = _safe_ratio(totals["successful"], total_requests)
+
+    endpoints = {}
+    for endpoint, data in endpoints_raw.items():
+        count = data["requests"]
+        endpoints[endpoint] = {
+            "requests": count,
+            "successful": data["successful"],
+            "failed": data["failed"],
+            "items_processed": data["items_processed"],
+            "manipulated": data["manipulated"],
+            "authentic": data["authentic"],
+            "uncertain": data["uncertain"],
+            "avg_latency_ms": round(data["latency_ms_sum"] / count, 2)
+            if count
+            else 0.0,
+            "success_rate": _safe_ratio(data["successful"], count),
+        }
+
+    return {
+        "app_version": APP_VERSION,
+        "model_mode": model_mode,
+        "model_ready": not bool(model_load_error),
+        "uptime_sec": uptime_sec,
+        "totals": totals,
+        "endpoints": endpoints,
+    }
+
+
+def _api_error(status_code, message, error_code, request_id=None):
+    payload = {
+        "error": message,
+        "error_code": error_code,
+    }
+    if request_id:
+        payload["request_id"] = request_id
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _load_eval_summary():
+    eval_path = EVAL_SUMMARY_PATH
+    if not eval_path.is_absolute():
+        eval_path = (ROOT_DIR / eval_path).resolve()
+
+    if not eval_path.exists():
+        raise FileNotFoundError(
+            f"Evaluation summary not found at {eval_path}. Run realeval.py with --out to generate it."
+        )
+
+    with open(eval_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        raise ValueError("Evaluation summary must be a JSON object")
+
+    payload.setdefault("source_path", str(eval_path))
+    return payload
+
+
+def _build_capabilities_summary():
+    summary = {
+        "app_version": APP_VERSION,
+        "model_mode": model_mode,
+        "probes": {
+            "liveness": "/live",
+            "readiness": "/ready",
+            "health": "/health",
+        },
+        "inference": {
+            "single": "/detect",
+            "batch": "/detect/batch",
+            "max_batch_files": MAX_BATCH_FILES,
+            "supported_extensions": SUPPORTED_EXTENSIONS,
+        },
+        "observability": {
+            "metrics": "/metrics",
+            "config": "/config",
+            "model_info": "/model-info",
+            "eval_summary": "/eval/summary",
+        },
+        "controls": {
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+            "max_request_seconds": MAX_REQUEST_SECONDS,
+            "metrics_reset_requires_token": bool(METRICS_ADMIN_TOKEN),
+        },
+    }
+
+    try:
+        eval_summary = _load_eval_summary()
+        summary["evaluation_headline"] = {
+            "num_samples": eval_summary.get("num_samples"),
+            "accuracy": eval_summary.get("accuracy"),
+            "f1": eval_summary.get("f1"),
+            "roc_auc": eval_summary.get("roc_auc"),
+            "source_path": eval_summary.get("source_path"),
+        }
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        summary["evaluation_headline"] = {
+            "num_samples": None,
+            "accuracy": None,
+            "f1": None,
+            "roc_auc": None,
+            "source_path": str(EVAL_SUMMARY_PATH),
+        }
+
+    return summary
 
 
 def _extract_state_dict(checkpoint):
@@ -124,13 +385,7 @@ def validate_upload(content, filename):
         raise ValueError(
             f"File too large ({size_mb:.2f} MB). Limit is {MAX_UPLOAD_MB} MB"
         )
-    if filename and Path(filename).suffix.lower() not in {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".mp4",
-        ".mov",
-    }:
+    if filename and Path(filename).suffix.lower() not in set(SUPPORTED_EXTENSIONS):
         raise ValueError("Unsupported extension. Use .jpg, .jpeg, .png, .mp4, .mov")
 
 
@@ -462,31 +717,31 @@ LAB_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Geist:wght@400;500;600;700&display=swap');
 
 :root {
-    --bg-sand: #FFF9F4;
-    --bg-sage: #E6F3F1;
-    --bg-cool: #EEF2F3;
-    --ink: #333842;
-    --muted: #6B7280;
+    --bg-sand: #F7F5F2;
+    --bg-sage: #EAF2EE;
+    --bg-cool: #E8EEF4;
+    --ink: #1D2430;
+    --muted: #5C6677;
     --panel: rgba(255, 255, 255, 0.94);
-    --panel-strong: rgba(255, 255, 255, 0.98);
-    --line: rgba(51, 56, 66, 0.12);
-    --accent: #4CB5AE;
-    --accent-2: #7DD1CA;
-    --coral: #E88A85;
-    --success: #24a06b;
-    --danger: #d84b5f;
-    --warn: #d18a1f;
-    --shadow-soft: 0 14px 30px rgba(0, 0, 0, 0.05), 0 3px 10px rgba(0, 0, 0, 0.04);
-    --shadow-hover: 0 18px 36px rgba(0, 0, 0, 0.08), 0 8px 16px rgba(0, 0, 0, 0.06);
+    --panel-strong: rgba(255, 255, 255, 0.99);
+    --line: rgba(37, 52, 80, 0.14);
+    --accent: #2F8C84;
+    --accent-2: #78BDAA;
+    --coral: #C97A72;
+    --success: #25885D;
+    --danger: #C74A5D;
+    --warn: #B98020;
+    --shadow-soft: 0 14px 30px rgba(19, 31, 48, 0.08), 0 3px 10px rgba(19, 31, 48, 0.05);
+    --shadow-hover: 0 20px 40px rgba(19, 31, 48, 0.12), 0 8px 16px rgba(19, 31, 48, 0.08);
 }
 
 html, body, .gradio-container {
     font-family: 'Inter', 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
     background:
-        radial-gradient(980px 680px at 5% -8%, rgba(255, 249, 244, 0.95) 0%, transparent 58%),
-        radial-gradient(920px 620px at 96% 8%, rgba(230, 243, 241, 0.92) 0%, transparent 60%),
-        radial-gradient(760px 520px at 56% 92%, rgba(238, 242, 243, 0.82) 0%, transparent 64%),
-        linear-gradient(132deg, #FFF9F4 0%, #E6F3F1 60%, #EEF2F3 100%);
+        radial-gradient(980px 680px at 5% -8%, rgba(247, 245, 242, 0.95) 0%, transparent 58%),
+        radial-gradient(920px 620px at 96% 8%, rgba(234, 242, 238, 0.92) 0%, transparent 60%),
+        radial-gradient(760px 520px at 56% 92%, rgba(232, 238, 244, 0.86) 0%, transparent 64%),
+        linear-gradient(132deg, #F7F5F2 0%, #EAF2EE 58%, #E8EEF4 100%);
     color: var(--ink);
 }
 
@@ -516,9 +771,9 @@ html, body, .gradio-container {
 }
 
 .lab-hero {
-    background: linear-gradient(145deg, rgba(255, 255, 255, 0.9), rgba(245, 252, 250, 0.82));
+    background: linear-gradient(145deg, rgba(255, 255, 255, 0.95), rgba(246, 250, 248, 0.86));
     border: 1px solid var(--line);
-    border-radius: 20px;
+    border-radius: 22px;
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
     box-shadow: var(--shadow-soft);
@@ -528,7 +783,7 @@ html, body, .gradio-container {
 
 .lab-title {
     font-size: 32px;
-    font-weight: 700;
+    font-weight: 800;
     letter-spacing: -0.02em;
     margin: 0 0 10px;
     color: var(--ink);
@@ -537,7 +792,7 @@ html, body, .gradio-container {
 
 .lab-subtitle {
     font-size: 15px;
-    line-height: 1.5;
+    line-height: 1.65;
     color: var(--muted);
     max-width: 760px;
 }
@@ -558,9 +813,9 @@ html, body, .gradio-container {
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.01em;
-    color: #2e384d;
-    background: rgba(255, 255, 255, 0.74);
-    border: 1px solid rgba(75, 98, 131, 0.18);
+    color: #2A3448;
+    background: rgba(255, 255, 255, 0.82);
+    border: 1px solid rgba(75, 98, 131, 0.2);
 }
 
 .lab-meta-chip.ok {
@@ -623,8 +878,8 @@ html, body, .gradio-container {
 .lab-panel {
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 16px;
-    padding: 28px;
+    border-radius: 18px;
+    padding: 24px;
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
     box-shadow: var(--shadow-soft);
@@ -632,7 +887,7 @@ html, body, .gradio-container {
 }
 
 .lab-panel:hover {
-    transform: scale(1.01) translateY(-2px);
+    transform: translateY(-2px);
     box-shadow: var(--shadow-hover);
     border-color: rgba(58, 80, 110, 0.18);
 }
@@ -661,9 +916,31 @@ html, body, .gradio-container {
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #5a3b3a;
-    background: linear-gradient(145deg, rgba(232, 138, 133, 0.22), rgba(232, 138, 133, 0.14));
-    border: 1px solid rgba(232, 138, 133, 0.35);
+    color: #6C4644;
+    background: linear-gradient(145deg, rgba(201, 122, 114, 0.2), rgba(201, 122, 114, 0.13));
+    border: 1px solid rgba(201, 122, 114, 0.32);
+}
+
+.section-card {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 18px;
+    box-shadow: var(--shadow-soft);
+}
+
+.section-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 4px;
+}
+
+.hint-text {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 10px;
 }
 
 .lab-panel-title {
@@ -681,12 +958,12 @@ html, body, .gradio-container {
 
 .gr-file {
     border-radius: 16px !important;
-    border: 1.8px dashed rgba(76, 181, 174, 0.64) !important;
-    background: #22252A !important;
+    border: 1.8px dashed rgba(47, 140, 132, 0.62) !important;
+    background: rgba(255, 255, 255, 0.72) !important;
     position: relative;
     overflow: hidden;
     transition: border-color 220ms ease, box-shadow 220ms ease, transform 220ms ease;
-    box-shadow: inset 0 1px 8px rgba(0, 0, 0, 0.3);
+    box-shadow: inset 0 1px 6px rgba(19, 31, 48, 0.12);
 }
 
 .gr-file::after {
@@ -703,8 +980,8 @@ html, body, .gradio-container {
 .gr-file:hover,
 .gr-file:focus-within,
 .gr-file.dragging {
-    border-color: rgba(76, 181, 174, 0.98) !important;
-    box-shadow: 0 0 0 1px rgba(76, 181, 174, 0.42), 0 0 22px rgba(232, 138, 133, 0.28), inset 0 1px 8px rgba(0, 0, 0, 0.3);
+    border-color: rgba(47, 140, 132, 0.98) !important;
+    box-shadow: 0 0 0 1px rgba(47, 140, 132, 0.35), 0 0 18px rgba(201, 122, 114, 0.2), inset 0 1px 8px rgba(19, 31, 48, 0.08);
     transform: translateY(-1px);
 }
 
@@ -722,10 +999,10 @@ html, body, .gradio-container {
 .gr-button-primary {
     border: 0 !important;
     border-radius: 16px !important;
-    background: linear-gradient(135deg, #4CB5AE 0%, #7DD1CA 100%) !important;
+    background: linear-gradient(135deg, #2F8C84 0%, #78BDAA 100%) !important;
     color: #ffffff !important;
     font-weight: 700 !important;
-    box-shadow: 0 10px 22px rgba(76, 181, 174, 0.28) !important;
+    box-shadow: 0 10px 22px rgba(47, 140, 132, 0.28) !important;
     transition: transform 220ms ease, box-shadow 220ms ease, filter 220ms ease !important;
 }
 
@@ -735,9 +1012,9 @@ html, body, .gradio-container {
 }
 
 .lab-actions .secondary {
-    border: 1px solid rgba(72, 90, 126, 0.22) !important;
-    background: rgba(255, 255, 255, 0.72) !important;
-    color: #2a3347 !important;
+    border: 1px solid rgba(72, 90, 126, 0.24) !important;
+    background: rgba(255, 255, 255, 0.84) !important;
+    color: #25324a !important;
     box-shadow: none !important;
 }
 
@@ -750,8 +1027,8 @@ html, body, .gradio-container {
 .lab-actions button:hover,
 .gr-button-primary:hover {
     filter: brightness(1.07);
-    transform: translateY(-1px) scale(1.05);
-    box-shadow: 0 0 0 1px rgba(76, 181, 174, 0.55), 0 14px 30px rgba(76, 181, 174, 0.34) !important;
+    transform: translateY(-1px) scale(1.02);
+    box-shadow: 0 0 0 1px rgba(47, 140, 132, 0.52), 0 14px 30px rgba(47, 140, 132, 0.3) !important;
 }
 
 .upload-meta {
@@ -782,7 +1059,7 @@ html, body, .gradio-container {
     width: 100%;
     height: 100%;
     border-radius: inherit;
-    background: linear-gradient(90deg, #4CB5AE 0%, #7DD1CA 65%, #E88A85 100%);
+    background: linear-gradient(90deg, #2F8C84 0%, #78BDAA 65%, #C97A72 100%);
     transform-origin: left center;
     animation: uploadFill 1.15s ease-out;
 }
@@ -882,9 +1159,9 @@ label,
 .gr-image {
     border-radius: 14px !important;
     overflow: hidden !important;
-    border: 1px solid rgba(106, 126, 166, 0.22) !important;
-    background: #22252A !important;
-    box-shadow: inset 0 1px 8px rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(106, 126, 166, 0.2) !important;
+    background: rgba(255, 255, 255, 0.9) !important;
+    box-shadow: inset 0 1px 8px rgba(19, 31, 48, 0.12);
 }
 
 .status-panel {
@@ -897,8 +1174,8 @@ label,
 .status-item {
     border-radius: 14px;
     padding: 12px 14px;
-    border: 1px solid rgba(59, 80, 119, 0.15);
-    background: rgba(255, 255, 255, 0.58);
+    border: 1px solid rgba(59, 80, 119, 0.16);
+    background: rgba(255, 255, 255, 0.72);
 }
 
 .status-label {
@@ -1045,7 +1322,7 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
             <div class="lab-hero">
                 <div class="lab-hero-main">
                     <div class="lab-title">Deepfake Detector Lab</div>
-                    <div class="lab-subtitle">Drop an image or video to see authenticity, heatmap evidence, and a plain-language summary.</div>
+                    <div class="lab-subtitle">Upload an image or video and get a clean forensic verdict, confidence, visual evidence, and a plain-language summary.</div>
                 </div>
             </div>
         """,
@@ -1061,131 +1338,137 @@ with gr.Blocks(title="Deepfake Detector", css=LAB_CSS) as demo:
         </div>
         """
     )
-    file_input = gr.File(label="Drag & drop image or video", file_types=[".jpg", ".jpeg", ".png", ".mp4", ".mov"])
-    upload_feedback = gr.HTML(build_upload_feedback(None))
-    upload_thumb = gr.Image(label="Upload Preview", interactive=False, elem_classes=["upload-thumb", "result-fade"])
-    analyze_btn = gr.Button("Analyze Evidence", variant="primary")
-    map_score = gr.HTML(value="")
-    preview = gr.Image(label="Preview (Red Grad-CAM)", interactive=False, elem_classes=["lab-preview-image", "result-fade"])
-    status_panel = gr.HTML(value="")
-    prediction = gr.Textbox(label="Prediction", interactive=False)
-    confidence = gr.Textbox(label="Confidence (%)", interactive=False)
-    generation = gr.Textbox(label="Generation Type", interactive=False)
-    diffusion_score = gr.Textbox(label="Diffusion Score", interactive=False)
-    explanation = gr.Textbox(label="Explanation", lines=4, interactive=False)
-    graph = gr.Image(label="Frame-Level Fake Confidence", interactive=False)
 
-# Place ClearButton after all components are defined, outside all UI blocks
-clear_btn = gr.ClearButton(
-    [
-        file_input,
-        prediction,
-        confidence,
-        status_panel,
-        map_score,
-        upload_feedback,
-        upload_thumb,
-        preview,
-        graph,
-        generation,
-        diffusion_score,
-        explanation,
-    ],
-    elem_classes=["secondary"],
-)
-
-# Launch Gradio app on a new port if run as main
-if __name__ == "__main__":
-    demo.launch(server_port=7861)
-
-        with gr.Column(scale=5, min_width=340, elem_classes=["lab-col-temporal"]):
-            with gr.Column(elem_classes=["lab-panel", "result-fade"]):
-                gr.Markdown(
-                    '<span class="lab-badge">Temporal</span><span class="lab-panel-title">Frame Graph</span>'
-                )
-                graph = gr.Image(label="Frame-Level Fake Confidence", interactive=False)
-
-        def handle_input(file_obj):
-            return predict_file(file_obj)
-
-        def clear_outputs():
-            return (
-                None,
-                "",
-                "",
-                "",
-                "",
-                build_upload_feedback(None),
-                None,
-                None,
-                None,
-                "",
-                "",
-                "",
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=5):
+            gr.HTML(
+                '<div class="section-card"><div class="section-title">1) Upload Media</div><div class="hint-text">Supported: JPG, PNG, MP4, MOV. For videos, multiple frames are sampled automatically.</div></div>'
+            )
+            file_input = gr.File(
+                label="Drag & drop image or video",
+                file_types=[".jpg", ".jpeg", ".png", ".mp4", ".mov"],
+            )
+            upload_feedback = gr.HTML(build_upload_feedback(None))
+            with gr.Row(elem_classes=["lab-actions"]):
+                analyze_btn = gr.Button("Analyze", variant="primary")
+                clear_btn = gr.Button("Clear", elem_classes=["secondary"])
+            upload_thumb = gr.Image(
+                label="Upload Preview",
+                interactive=False,
+                elem_classes=["upload-thumb", "result-fade"],
             )
 
-        def preview_file(file_obj):
-            if file_obj is None:
-                return build_upload_feedback(None), None
-            path = file_obj.name
-            mime, _ = mimetypes.guess_type(path)
-            if mime and mime.startswith("image"):
-                try:
-                    img = Image.open(path).convert("RGB")
-                    return build_upload_feedback(file_obj), img.resize((300, 300))
-                except Exception:
-                    return build_upload_feedback(file_obj), None
-            return build_upload_feedback(file_obj), None
+        with gr.Column(scale=7):
+            gr.HTML(
+                '<div class="section-card"><div class="section-title">2) Forensic Result</div><div class="hint-text">Confidence and verdict are shown together for quick interpretation.</div></div>'
+            )
+            prediction = gr.Textbox(label="Prediction", interactive=False)
+            confidence = gr.Textbox(label="Confidence (%)", interactive=False)
+            status_panel = gr.HTML(value="")
+            map_score = gr.HTML(value="")
+            preview = gr.Image(
+                label="Heatmap Preview (Grad-CAM)",
+                interactive=False,
+                elem_classes=["lab-preview-image", "result-fade"],
+            )
 
-        file_input.change(
-            fn=preview_file,
-            inputs=file_input,
-            outputs=[upload_feedback, upload_thumb],
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=4):
+            generation = gr.Textbox(label="Generation Type", interactive=False)
+        with gr.Column(scale=4):
+            diffusion_score = gr.Textbox(label="Diffusion Score", interactive=False)
+
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=7):
+            explanation = gr.Textbox(
+                label="Readable Explanation", lines=4, interactive=False
+            )
+        with gr.Column(scale=5):
+            graph = gr.Image(label="Frame Confidence Graph", interactive=False)
+
+    # Gradio event bindings
+    def handle_input(file_obj):
+        return predict_file(file_obj)
+
+    def clear_outputs():
+        return (
+            None,
+            "",
+            "",
+            "",
+            "",
+            build_upload_feedback(None),
+            None,
+            None,
+            None,
+            "",
+            "",
+            "",
         )
 
-        analyze_btn.click(
-            fn=handle_input,
-            inputs=file_input,
-            outputs=[
-                prediction,
-                confidence,
-                status_panel,
-                map_score,
-                upload_feedback,
-                upload_thumb,
-                preview,
-                graph,
-                generation,
-                diffusion_score,
-                explanation,
-            ],
-        )
+    def preview_file(file_obj):
+        if file_obj is None:
+            return build_upload_feedback(None), None
+        path = file_obj.name
+        mime, _ = mimetypes.guess_type(path)
+        if mime and mime.startswith("image"):
+            try:
+                img = Image.open(path).convert("RGB")
+                return build_upload_feedback(file_obj), img.resize((300, 300))
+            except Exception:
+                return build_upload_feedback(file_obj), None
+        return build_upload_feedback(file_obj), None
 
-        clear_btn.click(
-            fn=clear_outputs,
-            inputs=[],
-            outputs=[
-                file_input,
-                prediction,
-                confidence,
-                status_panel,
-                map_score,
-                upload_feedback,
-                upload_thumb,
-                preview,
-                graph,
-                generation,
-                diffusion_score,
-                explanation,
-            ],
-        )
+    file_input.change(
+        fn=preview_file,
+        inputs=file_input,
+        outputs=[upload_feedback, upload_thumb],
+    )
+
+    analyze_btn.click(
+        fn=handle_input,
+        inputs=file_input,
+        outputs=[
+            prediction,
+            confidence,
+            status_panel,
+            map_score,
+            upload_feedback,
+            upload_thumb,
+            preview,
+            graph,
+            generation,
+            diffusion_score,
+            explanation,
+        ],
+    )
+
+    clear_btn.click(
+        fn=clear_outputs,
+        inputs=[],
+        outputs=[
+            file_input,
+            prediction,
+            confidence,
+            status_panel,
+            map_score,
+            upload_feedback,
+            upload_thumb,
+            preview,
+            graph,
+            generation,
+            diffusion_score,
+            explanation,
+        ],
+    )
 
 app = FastAPI()
 
 
 @app.get("/health")
 async def health():
-    return {
+    start_time = time.perf_counter()
+    payload = {
         "status": "ok" if not model_load_error else "degraded",
         "model_ready": not bool(model_load_error),
         "model_mode": model_mode,
@@ -1193,11 +1476,58 @@ async def health():
         "max_upload_mb": MAX_UPLOAD_MB,
         "error": model_load_error or "",
     }
+    _update_api_metrics(
+        endpoint="/health",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return payload
+
+
+@app.get("/live")
+async def live():
+    start_time = time.perf_counter()
+    payload = {
+        "status": "alive",
+        "app_version": APP_VERSION,
+        "uptime_sec": round(time.time() - APP_START_TIME, 2),
+    }
+    _update_api_metrics(
+        endpoint="/live",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return payload
+
+
+@app.get("/ready")
+async def ready():
+    start_time = time.perf_counter()
+    model_ready = not bool(model_load_error)
+    payload = {
+        "status": "ready" if model_ready else "not_ready",
+        "model_ready": model_ready,
+        "model_mode": model_mode,
+        "app_version": APP_VERSION,
+        "error": model_load_error or "",
+    }
+    _update_api_metrics(
+        endpoint="/ready",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=model_ready,
+        items_processed=0,
+    )
+    if not model_ready:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.get("/model-info")
 async def model_info():
-    return {
+    start_time = time.perf_counter()
+    payload = {
         "model_mode": model_mode,
         "hybrid_checkpoint": str(HYBRID_MODEL_PATH),
         "legacy_checkpoint": str(LEGACY_MODEL_PATH),
@@ -1208,32 +1538,166 @@ async def model_info():
         "load_error": model_load_error or "",
         "app_version": APP_VERSION,
     }
+    _update_api_metrics(
+        endpoint="/model-info",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return payload
+
+
+@app.get("/metrics")
+async def metrics():
+    start_time = time.perf_counter()
+    _update_api_metrics(
+        endpoint="/metrics",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return _build_metrics_response()
+
+
+@app.get("/config")
+async def config_info():
+    start_time = time.perf_counter()
+    payload = {
+        "app_version": APP_VERSION,
+        "model_mode": model_mode,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "max_batch_files": MAX_BATCH_FILES,
+        "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        "max_request_seconds": MAX_REQUEST_SECONDS,
+        "supported_extensions": SUPPORTED_EXTENSIONS,
+        "metrics_reset_enabled": bool(METRICS_ADMIN_TOKEN),
+        "eval_summary_path": str(EVAL_SUMMARY_PATH),
+    }
+    _update_api_metrics(
+        endpoint="/config",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return payload
+
+
+@app.get("/capabilities")
+async def capabilities():
+    start_time = time.perf_counter()
+    payload = _build_capabilities_summary()
+    _update_api_metrics(
+        endpoint="/capabilities",
+        duration_ms=(time.perf_counter() - start_time) * 1000,
+        success=True,
+        items_processed=0,
+    )
+    return payload
+
+
+@app.post("/metrics/reset")
+async def reset_metrics(x_admin_token: str | None = Header(default=None)):
+    if not METRICS_ADMIN_TOKEN:
+        return _api_error(
+            status_code=403,
+            message="Metrics reset is disabled on this deployment",
+            error_code="METRICS_RESET_DISABLED",
+        )
+    if x_admin_token != METRICS_ADMIN_TOKEN:
+        return _api_error(
+            status_code=403,
+            message="Invalid admin token",
+            error_code="INVALID_ADMIN_TOKEN",
+        )
+
+    _reset_api_metrics()
+    return {
+        "status": "ok",
+        "message": "Metrics reset successfully",
+    }
+
+
+@app.get("/eval/summary")
+async def eval_summary():
+    start_time = time.perf_counter()
+    try:
+        payload = _load_eval_summary()
+        _update_api_metrics(
+            endpoint="/eval/summary",
+            duration_ms=(time.perf_counter() - start_time) * 1000,
+            success=True,
+            items_processed=0,
+        )
+        return payload
+    except FileNotFoundError as exc:
+        _update_api_metrics(
+            endpoint="/eval/summary",
+            duration_ms=(time.perf_counter() - start_time) * 1000,
+            success=False,
+            items_processed=0,
+        )
+        return _api_error(
+            status_code=404,
+            message=str(exc),
+            error_code="EVAL_SUMMARY_NOT_FOUND",
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        _update_api_metrics(
+            endpoint="/eval/summary",
+            duration_ms=(time.perf_counter() - start_time) * 1000,
+            success=False,
+            items_processed=0,
+        )
+        return _api_error(
+            status_code=500,
+            message=f"Invalid evaluation summary: {exc}",
+            error_code="EVAL_SUMMARY_INVALID",
+        )
 
 
 @app.post("/detect")
-async def detect(file: UploadFile = File(...)):
+async def detect(request: Request, file: UploadFile = File(...)):
     start_time = time.perf_counter()
-    if model_load_error:
-        return {"error": get_model_error_message()}
-
-    content = await file.read()
-    validate_upload(content, file.filename)
-    suffix = Path(file.filename or "").suffix.lower()
-    if not suffix:
-        suffix = ".bin"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    success = False
+    manipulated = 0
+    authentic = 0
+    uncertain = 0
+    result = {"error": "Unknown error"}
+    tmp_path = ""
+    content = b""
 
     try:
+        _enforce_rate_limit(
+            endpoint="/detect",
+            client_key=request.client.host if request.client else "unknown",
+        )
+        if model_load_error:
+            result = _api_error(
+                status_code=503,
+                message=get_model_error_message(),
+                error_code="MODEL_NOT_READY",
+            )
+            return result
+
+        content = await file.read()
+        _ensure_not_timed_out(start_time)
+        validate_upload(content, file.filename)
+        suffix = Path(file.filename or "").suffix.lower()
+        if not suffix:
+            suffix = ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
         mime, _ = mimetypes.guess_type(tmp_path)
         if mime and mime.startswith("image"):
             img = Image.open(tmp_path).convert("RGB")
+            _ensure_not_timed_out(start_time)
             label, confidence, overlay, fake_prob = predict_with_cam(img)
             diffusion_score = diffusion_heuristic_score(img)
             generation = classify_generation(fake_prob, diffusion_score)
             reasons = build_reasons(fake_prob, diffusion_score)
-            return {
+            result = {
                 "type": "image",
                 "prediction": label,
                 "confidence": round(fake_prob, 4),
@@ -1243,12 +1707,22 @@ async def detect(file: UploadFile = File(...)):
                 "heatmap": image_to_base64(overlay),
                 "meta": build_meta(start_time, file.filename, content),
             }
+            manipulated, authentic, uncertain = _verdict_counts_from_prediction(label)
+            success = True
+            return result
 
         if mime and mime.startswith("video"):
             frames = sample_video_frames(tmp_path)
+            _ensure_not_timed_out(start_time)
             if not frames:
-                return {"error": "Could not read video"}
+                result = _api_error(
+                    status_code=422,
+                    message="Could not read video",
+                    error_code="VIDEO_DECODE_FAILED",
+                )
+                return result
             frame_probs = [predict_fake_prob(frame) for frame in frames]
+            _ensure_not_timed_out(start_time)
             diffusion_scores = [diffusion_heuristic_score(frame) for frame in frames]
             avg_prob = float(np.mean(frame_probs))
             avg_diffusion = float(np.mean(diffusion_scores))
@@ -1256,11 +1730,10 @@ async def detect(file: UploadFile = File(...)):
             reasons = build_reasons(avg_prob, avg_diffusion, frame_probs=frame_probs)
             overlay = predict_with_cam(frames[0])[2]
             graph = plot_frame_probs(frame_probs)
-            return {
+            prediction = "🔴 Deepfake (avg)" if avg_prob >= 0.5 else "🟢 Real (avg)"
+            result = {
                 "type": "video",
-                "prediction": "🔴 Deepfake (avg)"
-                if avg_prob >= 0.5
-                else "🟢 Real (avg)",
+                "prediction": prediction,
                 "confidence": round(avg_prob, 4),
                 "generation": generation,
                 "diffusion_score": round(avg_diffusion, 4),
@@ -1270,113 +1743,223 @@ async def detect(file: UploadFile = File(...)):
                 "frame_graph": image_to_base64(graph),
                 "meta": build_meta(start_time, file.filename, content),
             }
-
-        return {"error": "Unsupported file type"}
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
-@app.post("/detect/batch")
-async def detect_batch(files: list[UploadFile] = File(...)):
-    if model_load_error:
-        return {"error": get_model_error_message()}
-
-    if len(files) > 10:
-        return {"error": "Batch limit exceeded. Maximum 10 files per request."}
-
-    results = []
-    for file in files:
-        start_time = time.perf_counter()
-        content = await file.read()
-        try:
-            validate_upload(content, file.filename)
-        except ValueError as exc:
-            results.append(
-                {
-                    "filename": file.filename,
-                    "error": str(exc),
-                    "meta": build_meta(start_time, file.filename, content),
-                }
+            manipulated, authentic, uncertain = _verdict_counts_from_prediction(
+                prediction
             )
-            continue
+            success = True
+            return result
 
-        suffix = Path(file.filename or "").suffix.lower() or ".bin"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        try:
-            mime, _ = mimetypes.guess_type(tmp_path)
-            if mime and mime.startswith("image"):
-                img = Image.open(tmp_path).convert("RGB")
-                label, _, _, fake_prob = predict_with_cam(img)
-                diffusion_score = diffusion_heuristic_score(img)
-                generation = classify_generation(fake_prob, diffusion_score)
-                reasons = build_reasons(fake_prob, diffusion_score)
-                results.append(
-                    {
-                        "filename": file.filename,
-                        "type": "image",
-                        "prediction": label,
-                        "confidence": round(fake_prob, 4),
-                        "generation": generation,
-                        "diffusion_score": round(diffusion_score, 4),
-                        "reasons": reasons,
-                        "meta": build_meta(start_time, file.filename, content),
-                    }
-                )
-            elif mime and mime.startswith("video"):
-                frames = sample_video_frames(tmp_path)
-                if not frames:
-                    results.append(
-                        {
-                            "filename": file.filename,
-                            "error": "Could not read video",
-                            "meta": build_meta(start_time, file.filename, content),
-                        }
-                    )
-                    continue
-
-                frame_probs = [predict_fake_prob(frame) for frame in frames]
-                diffusion_scores = [
-                    diffusion_heuristic_score(frame) for frame in frames
-                ]
-                avg_prob = float(np.mean(frame_probs))
-                avg_diffusion = float(np.mean(diffusion_scores))
-                generation = classify_generation(avg_prob, avg_diffusion)
-                reasons = build_reasons(
-                    avg_prob, avg_diffusion, frame_probs=frame_probs
-                )
-                results.append(
-                    {
-                        "filename": file.filename,
-                        "type": "video",
-                        "prediction": "🔴 Deepfake (avg)"
-                        if avg_prob >= 0.5
-                        else "🟢 Real (avg)",
-                        "confidence": round(avg_prob, 4),
-                        "generation": generation,
-                        "diffusion_score": round(avg_diffusion, 4),
-                        "reasons": reasons,
-                        "meta": build_meta(start_time, file.filename, content),
-                    }
-                )
-            else:
-                results.append(
-                    {
-                        "filename": file.filename,
-                        "error": "Unsupported file type",
-                        "meta": build_meta(start_time, file.filename, content),
-                    }
-                )
-        finally:
+        result = _api_error(
+            status_code=415,
+            message="Unsupported file type",
+            error_code="UNSUPPORTED_FILE_TYPE",
+        )
+        return result
+    except ValueError as exc:
+        result = _api_error(
+            status_code=400,
+            message=str(exc),
+            error_code="VALIDATION_ERROR",
+        )
+        return result
+    except PermissionError as exc:
+        result = _api_error(
+            status_code=429,
+            message=str(exc),
+            error_code="RATE_LIMIT_EXCEEDED",
+        )
+        return result
+    except TimeoutError as exc:
+        result = _api_error(
+            status_code=408,
+            message=str(exc),
+            error_code="REQUEST_TIMEOUT",
+        )
+        return result
+    except Exception as exc:
+        result = _api_error(
+            status_code=500,
+            message=f"Inference failed: {exc}",
+            error_code="INFERENCE_ERROR",
+        )
+        return result
+    finally:
+        if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
+        _update_api_metrics(
+            endpoint="/detect",
+            duration_ms=(time.perf_counter() - start_time) * 1000,
+            success=success,
+            items_processed=1,
+            manipulated=manipulated,
+            authentic=authentic,
+            uncertain=uncertain,
+        )
+
+
+@app.post("/detect/batch")
+async def detect_batch(request: Request, files: list[UploadFile] = File(...)):
+    request_start_time = time.perf_counter()
+    try:
+        _enforce_rate_limit(
+            endpoint="/detect/batch",
+            client_key=request.client.host if request.client else "unknown",
+        )
+    except PermissionError as exc:
+        payload = _api_error(
+            status_code=429,
+            message=str(exc),
+            error_code="RATE_LIMIT_EXCEEDED",
+        )
+        _update_api_metrics(
+            endpoint="/detect/batch",
+            duration_ms=(time.perf_counter() - request_start_time) * 1000,
+            success=False,
+            items_processed=0,
+        )
+        return payload
+
+    if model_load_error:
+        payload = _api_error(
+            status_code=503,
+            message=get_model_error_message(),
+            error_code="MODEL_NOT_READY",
+        )
+        _update_api_metrics(
+            endpoint="/detect/batch",
+            duration_ms=(time.perf_counter() - request_start_time) * 1000,
+            success=False,
+            items_processed=0,
+        )
+        return payload
+
+    if len(files) > MAX_BATCH_FILES:
+        payload = _api_error(
+            status_code=400,
+            message=f"Batch limit exceeded. Maximum {MAX_BATCH_FILES} files per request.",
+            error_code="BATCH_LIMIT_EXCEEDED",
+        )
+        _update_api_metrics(
+            endpoint="/detect/batch",
+            duration_ms=(time.perf_counter() - request_start_time) * 1000,
+            success=False,
+            items_processed=len(files),
+        )
+        return payload
+
+    results = []
+    try:
+        for file in files:
+            item_start_time = time.perf_counter()
+            _ensure_not_timed_out(request_start_time)
+            content = await file.read()
+            try:
+                validate_upload(content, file.filename)
+            except ValueError as exc:
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "error": str(exc),
+                        "meta": build_meta(item_start_time, file.filename, content),
+                    }
+                )
+                continue
+
+            suffix = Path(file.filename or "").suffix.lower() or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            try:
+                mime, _ = mimetypes.guess_type(tmp_path)
+                if mime and mime.startswith("image"):
+                    _ensure_not_timed_out(request_start_time)
+                    img = Image.open(tmp_path).convert("RGB")
+                    label, _, _, fake_prob = predict_with_cam(img)
+                    diffusion_score = diffusion_heuristic_score(img)
+                    generation = classify_generation(fake_prob, diffusion_score)
+                    reasons = build_reasons(fake_prob, diffusion_score)
+                    results.append(
+                        {
+                            "filename": file.filename,
+                            "type": "image",
+                            "prediction": label,
+                            "confidence": round(fake_prob, 4),
+                            "generation": generation,
+                            "diffusion_score": round(diffusion_score, 4),
+                            "reasons": reasons,
+                            "meta": build_meta(item_start_time, file.filename, content),
+                        }
+                    )
+                elif mime and mime.startswith("video"):
+                    _ensure_not_timed_out(request_start_time)
+                    frames = sample_video_frames(tmp_path)
+                    if not frames:
+                        results.append(
+                            {
+                                "filename": file.filename,
+                                "error": "Could not read video",
+                                "meta": build_meta(
+                                    item_start_time, file.filename, content
+                                ),
+                            }
+                        )
+                        continue
+
+                    frame_probs = [predict_fake_prob(frame) for frame in frames]
+                    _ensure_not_timed_out(request_start_time)
+                    diffusion_scores = [
+                        diffusion_heuristic_score(frame) for frame in frames
+                    ]
+                    avg_prob = float(np.mean(frame_probs))
+                    avg_diffusion = float(np.mean(diffusion_scores))
+                    generation = classify_generation(avg_prob, avg_diffusion)
+                    reasons = build_reasons(
+                        avg_prob, avg_diffusion, frame_probs=frame_probs
+                    )
+                    results.append(
+                        {
+                            "filename": file.filename,
+                            "type": "video",
+                            "prediction": "🔴 Deepfake (avg)"
+                            if avg_prob >= 0.5
+                            else "🟢 Real (avg)",
+                            "confidence": round(avg_prob, 4),
+                            "generation": generation,
+                            "diffusion_score": round(avg_diffusion, 4),
+                            "reasons": reasons,
+                            "meta": build_meta(item_start_time, file.filename, content),
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "filename": file.filename,
+                            "error": "Unsupported file type",
+                            "meta": build_meta(item_start_time, file.filename, content),
+                        }
+                    )
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except TimeoutError as exc:
+        payload = _api_error(
+            status_code=408,
+            message=str(exc),
+            error_code="REQUEST_TIMEOUT",
+        )
+        _update_api_metrics(
+            endpoint="/detect/batch",
+            duration_ms=(time.perf_counter() - request_start_time) * 1000,
+            success=False,
+            items_processed=len(results),
+        )
+        return payload
 
     manipulated = sum(
         1
@@ -1388,7 +1971,7 @@ async def detect_batch(files: list[UploadFile] = File(...)):
     )
     failed = sum(1 for item in results if "error" in item)
 
-    return {
+    payload = {
         "count": len(results),
         "summary": {
             "manipulated": manipulated,
@@ -1397,6 +1980,16 @@ async def detect_batch(files: list[UploadFile] = File(...)):
         },
         "results": results,
     }
+    _update_api_metrics(
+        endpoint="/detect/batch",
+        duration_ms=(time.perf_counter() - request_start_time) * 1000,
+        success=(failed == 0),
+        items_processed=len(results),
+        manipulated=manipulated,
+        authentic=authentic,
+        uncertain=max(len(results) - manipulated - authentic - failed, 0),
+    )
+    return payload
 
 
 app = gr.mount_gradio_app(app, demo, path="/")

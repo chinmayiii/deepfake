@@ -1,0 +1,313 @@
+{
+  "generated_at_utc": "2026-03-26T10:14:37.271311+00:00",
+  "base_url": "http://127.0.0.1:7860",
+  "iterations": 20,
+  "endpoints": [
+    "/live",
+    "/ready",
+    "/health",
+    "/model-info",
+    "/config",
+    "/capabilities",
+    "/eval/summary",
+    "/metrics"
+  ],
+  "results": {
+    "/live": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 4.44,
+      "p95_ms": 14.11,
+      "min_ms": 1.3,
+      "max_ms": 37.94,
+      "rps_estimate": 225.39,
+      "sample_payload": {
+        "status": "alive",
+        "app_version": "1.0.0",
+        "uptime_sec": 83.8
+      }
+    },
+    "/ready": {
+      "status_codes": [
+        503
+      ],
+      "avg_ms": 2.03,
+      "p95_ms": 2.87,
+      "min_ms": 1.52,
+      "max_ms": 4.0,
+      "rps_estimate": 493.8,
+      "sample_payload": {
+        "status": "not_ready",
+        "model_ready": false,
+        "model_mode": "single",
+        "app_version": "1.0.0",
+        "error": "Model loading skipped (SKIP_MODEL_LOAD=1)"
+      }
+    },
+    "/health": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 2.04,
+      "p95_ms": 2.87,
+      "min_ms": 1.36,
+      "max_ms": 3.06,
+      "rps_estimate": 490.72,
+      "sample_payload": {
+        "status": "degraded",
+        "model_ready": false,
+        "model_mode": "single",
+        "app_version": "1.0.0",
+        "max_upload_mb": 50,
+        "error": "Model loading skipped (SKIP_MODEL_LOAD=1)"
+      }
+    },
+    "/model-info": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 2.25,
+      "p95_ms": 3.84,
+      "min_ms": 1.49,
+      "max_ms": 4.1,
+      "rps_estimate": 444.58,
+      "sample_payload": {
+        "model_mode": "single",
+        "hybrid_checkpoint": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\models\\best_model-hybrid.pt",
+        "legacy_checkpoint": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\models\\best_model-v3.pt",
+        "loaded_checkpoint": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\models\\best_model-v3.pt",
+        "model_ready": false,
+        "load_error": "Model loading skipped (SKIP_MODEL_LOAD=1)",
+        "app_version": "1.0.0"
+      }
+    },
+    "/config": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 1.95,
+      "p95_ms": 2.45,
+      "min_ms": 1.5,
+      "max_ms": 3.31,
+      "rps_estimate": 511.94,
+      "sample_payload": {
+        "app_version": "1.0.0",
+        "model_mode": "single",
+        "max_upload_mb": 50,
+        "max_batch_files": 10,
+        "rate_limit_per_min": 60,
+        "max_request_seconds": 30,
+        "supported_extensions": [
+          ".jpg",
+          ".jpeg",
+          ".png",
+          ".mp4",
+          ".mov"
+        ],
+        "metrics_reset_enabled": true,
+        "eval_summary_path": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\docs\\eval_summary.json"
+      }
+    },
+    "/capabilities": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 2.74,
+      "p95_ms": 3.92,
+      "min_ms": 2.03,
+      "max_ms": 4.31,
+      "rps_estimate": 365.23,
+      "sample_payload": {
+        "app_version": "1.0.0",
+        "model_mode": "single",
+        "probes": {
+          "liveness": "/live",
+          "readiness": "/ready",
+          "health": "/health"
+        },
+        "inference": {
+          "single": "/detect",
+          "batch": "/detect/batch",
+          "max_batch_files": 10,
+          "supported_extensions": [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".mp4",
+            ".mov"
+          ]
+        },
+        "observability": {
+          "metrics": "/metrics",
+          "config": "/config",
+          "model_info": "/model-info",
+          "eval_summary": "/eval/summary"
+        },
+        "controls": {
+          "max_upload_mb": 50,
+          "rate_limit_per_min": 60,
+          "max_request_seconds": 30,
+          "metrics_reset_requires_token": true
+        },
+        "evaluation_headline": {
+          "num_samples": 0,
+          "accuracy": 0.0,
+          "f1": 0.0,
+          "roc_auc": 0.0,
+          "source_path": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\docs\\eval_summary.json"
+        }
+      }
+    },
+    "/eval/summary": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 9.67,
+      "p95_ms": 33.74,
+      "min_ms": 2.08,
+      "max_ms": 52.39,
+      "rps_estimate": 103.46,
+      "sample_payload": {
+        "num_samples": 0,
+        "model_path": "models/best_model-v3.pt",
+        "model_mode": "single",
+        "accuracy": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "roc_auc": 0.0,
+        "confusion_matrix": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "notes": "Placeholder summary. Run: python realeval.py --data <path-to-real-fake-dataset> --out docs/eval_summary.json",
+        "source_path": "C:\\Users\\smile\\OneDrive\\facemask\\DeepfakeDetector\\docs\\eval_summary.json"
+      }
+    },
+    "/metrics": {
+      "status_codes": [
+        200
+      ],
+      "avg_ms": 2.28,
+      "p95_ms": 2.65,
+      "min_ms": 1.81,
+      "max_ms": 3.88,
+      "rps_estimate": 438.29,
+      "sample_payload": {
+        "app_version": "1.0.0",
+        "model_mode": "single",
+        "model_ready": false,
+        "uptime_sec": 84.25,
+        "totals": {
+          "requests": 182,
+          "successful": 161,
+          "failed": 21,
+          "items_processed": 0,
+          "manipulated": 0,
+          "authentic": 0,
+          "uncertain": 0,
+          "latency_ms_sum": 17.278999963309616,
+          "avg_latency_ms": 0.09,
+          "success_rate": 0.8846
+        },
+        "endpoints": {
+          "/health": {
+            "requests": 21,
+            "successful": 21,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.0,
+            "success_rate": 1.0
+          },
+          "/live": {
+            "requests": 40,
+            "successful": 40,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.01,
+            "success_rate": 1.0
+          },
+          "/ready": {
+            "requests": 21,
+            "successful": 0,
+            "failed": 21,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.0,
+            "success_rate": 0.0
+          },
+          "/model-info": {
+            "requests": 20,
+            "successful": 20,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.01,
+            "success_rate": 1.0
+          },
+          "/config": {
+            "requests": 20,
+            "successful": 20,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.01,
+            "success_rate": 1.0
+          },
+          "/capabilities": {
+            "requests": 20,
+            "successful": 20,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.44,
+            "success_rate": 1.0
+          },
+          "/eval/summary": {
+            "requests": 20,
+            "successful": 20,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.38,
+            "success_rate": 1.0
+          },
+          "/metrics": {
+            "requests": 20,
+            "successful": 20,
+            "failed": 0,
+            "items_processed": 0,
+            "manipulated": 0,
+            "authentic": 0,
+            "uncertain": 0,
+            "avg_latency_ms": 0.0,
+            "success_rate": 1.0
+          }
+        }
+      }
+    }
+  }
+}

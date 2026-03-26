@@ -27,4 +27,4 @@ jobs:
         env:
           SKIP_MODEL_LOAD: "1"
         run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
+          python -W ignore::ResourceWarning -m unittest discover -s tests -p "test_*.py" -v

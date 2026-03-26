@@ -1,10 +1,16 @@
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
-from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
 from torchvision import transforms
 from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0
 
@@ -71,7 +77,9 @@ def load_samples(dataset_root: Path):
                 samples.append((file_path, label_idx))
 
     if not samples:
-        raise ValueError(f"No images found in {dataset_root}/real or {dataset_root}/fake")
+        raise ValueError(
+            f"No images found in {dataset_root}/real or {dataset_root}/fake"
+        )
     return samples
 
 
@@ -128,7 +136,9 @@ def evaluate(dataset_root: Path, model_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate DeepfakeDetector model on real/fake folders")
+    parser = argparse.ArgumentParser(
+        description="Evaluate DeepfakeDetector model on real/fake folders"
+    )
     parser.add_argument(
         "--data",
         required=True,
@@ -138,6 +148,11 @@ def main():
         "--model",
         default=None,
         help="Optional model path. Defaults to models/best_model-hybrid.pt if present, otherwise models/best_model-v3.pt",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional output JSON path for evaluation summary (for /eval/summary API endpoint)",
     )
     args = parser.parse_args()
 
@@ -158,6 +173,27 @@ def main():
     print(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
     print("Confusion Matrix [rows=true (real,fake), cols=pred (real,fake)]")
     print(np.array2string(cm))
+
+    if args.out:
+        out_path = Path(args.out)
+        if not out_path.is_absolute():
+            out_path = (root / out_path).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        summary = {
+            "num_samples": int(metrics["num_samples"]),
+            "model_path": metrics["model_path"],
+            "model_mode": metrics["model_mode"],
+            "accuracy": float(metrics["accuracy"]),
+            "precision": float(metrics["precision"]),
+            "recall": float(metrics["recall"]),
+            "f1": float(metrics["f1"]),
+            "roc_auc": float(metrics["roc_auc"]),
+            "confusion_matrix": cm.tolist(),
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved evaluation summary JSON to: {out_path}")
 
 
 if __name__ == "__main__":
